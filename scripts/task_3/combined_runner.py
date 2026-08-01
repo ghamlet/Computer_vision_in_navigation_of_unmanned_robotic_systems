@@ -2,7 +2,7 @@
 """
 Объединённый скрипт: движение по разметке + детекция светофора.
 При потере трека светофора -> STATE = STOP.
-Стримит результат в браузер по MJPEG.
+Стримит результат в браузер по MJPEG с поддержкой нескольких именованных стримов.
 """
 
 import atexit
@@ -11,6 +11,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Dict, Optional
 
 import cv2
 import numpy as np
@@ -28,7 +29,7 @@ except ImportError:
 # ========== КОНФИГУРАЦИЯ ==========
 # Движение
 CAR_SPEED = 1600
-THRESHOLD = 230
+THRESHOLD = 240
 CAMERA_ID = '/dev/video0'
 ARDUINO_PORT = '/dev/ttyUSB0'
 
@@ -36,9 +37,14 @@ ARDUINO_PORT = '/dev/ttyUSB0'
 TRAFFIC_LIGHT_CLASS = 9
 TARGET_SIZE = (1280, 960)
 
-TRACK_MAX_MISSED = 15
-TRACK_MAX_DIST = 200
-TRACK_CONFIRM_FRAMES = 3
+# Область поиска светофора (как знак в task_2/StadionRunner.py: полоса 300-640)
+DETECT_BAND_Y1 = 300
+DETECT_BAND_Y2 = 640
+
+# Трекинг (как в task_2/StadionRunner.py)
+TRACK_DIST = 100      # макс. смещение центра между соседними кадрами, px
+TRACK_MISS_MAX = 5    # через сколько кадров без детекта трек сбрасывается
+TRACK_CONFIRM = 3     # сколько кадров подряд нужно для подтверждения
 
 # Зеленые зоны
 TOP_FILL_H = 100
@@ -59,10 +65,119 @@ JPEG_QUALITY = 70
 
 MODEL_DIR = Path("/home/arrma/Computer_vision_in_navigation_of_unmanned_robotic_systems/scripts/models")
 
-jpeg_lock = threading.Lock()
-current_jpeg = None
-
 arduino = None
+
+
+class MJPEGStreamer:
+    """Многопоточный MJPEG стример с поддержкой нескольких именованных потоков."""
+
+    def __init__(self, host: str = '0.0.0.0', port: int = 8088, quality: int = 70):
+        self.host = host
+        self.port = port
+        self.quality = quality
+        self._streams: Dict[str, threading.Lock] = {}
+        self._frames: Dict[str, Optional[bytes]] = {}
+        self._server: Optional[ThreadingHTTPServer] = None
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+
+    def create_stream(self, name: str) -> None:
+        """Создает новый именованный поток."""
+        if name not in self._streams:
+            self._streams[name] = threading.Lock()
+            self._frames[name] = None
+
+    def imshow(self, name: str, frame: np.ndarray) -> None:
+        """Заменяет cv2.imshow(name, frame) - отправляет кадр в именованный поток."""
+        if name not in self._streams:
+            self.create_stream(name)
+        ok, jpg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, self.quality])
+        if ok:
+            with self._streams[name]:
+                self._frames[name] = jpg.tobytes()
+
+    def start(self) -> None:
+        """Запускает HTTP сервер."""
+        if self._running:
+            return
+
+        class StreamHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                stream_name = self.path.lstrip('/')
+                if stream_name not in streamer._streams:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+                self.end_headers()
+                while streamer._running:
+                    with streamer._streams[stream_name]:
+                        frame = streamer._frames[stream_name]
+                    if frame is None:
+                        time.sleep(0.01)
+                        continue
+                    try:
+                        self.wfile.write(b'--frame\r\n')
+                        self.wfile.write(b'Content-Type: image/jpeg\r\n\r\n')
+                        self.wfile.write(frame)
+                        self.wfile.write(b'\r\n')
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        break
+
+            def log_message(self, *args):
+                pass
+
+        self._server = ThreadingHTTPServer((self.host, self.port), StreamHandler)
+        self._running = True
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Останавливает HTTP сервер."""
+        self._running = False
+        if self._server:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+        if self._thread:
+            self._thread.join(timeout=2)
+            self._thread = None
+
+
+def dist_to_track(x, y, track_state):
+    if track_state['x'] is None:
+        return None
+    return ((x - track_state['x']) ** 2 + (y - track_state['y']) ** 2) ** 0.5
+
+
+def update_tracker(centroids, track_state):
+    """Обновляет трек. Возвращает True если трек обновлён, False если нет."""
+    if not centroids:
+        track_state['missed'] += 1
+        return False
+
+    if track_state['x'] is None:
+        track_state['x'], track_state['y'] = centroids[0]
+        track_state['missed'] = 0
+        track_state['confirmed'] = 1
+        track_state['lost_printed'] = False
+        return True
+
+    distances = [dist_to_track(cx, cy, track_state) for cx, cy in centroids]
+    idx = int(np.argmin(distances))
+    if distances[idx] > TRACK_DIST:
+        track_state['missed'] += 1
+        if track_state['missed'] > TRACK_MISS_MAX:
+            track_state.update(x=None, y=None, missed=0, confirmed=0, lost_printed=False)
+        return False
+
+    track_state['x'], track_state['y'] = centroids[idx]
+    track_state['missed'] = 0
+    track_state['confirmed'] = min(track_state['confirmed'] + 1, TRACK_CONFIRM + 10)
+    return True
+
+
+streamer = MJPEGStreamer(STREAM_HOST, STREAM_PORT, JPEG_QUALITY)
 
 
 def fill_zones(frame):
@@ -137,31 +252,6 @@ class TrafficLightDetector:
         return frame
 
 
-class StreamHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path != '/':
-            self.send_error(404)
-            return
-        self.send_response(200)
-        self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
-        self.end_headers()
-        while True:
-            with jpeg_lock:
-                frame = current_jpeg
-            if frame is None:
-                continue
-            try:
-                self.wfile.write(b'--frame\r\n')
-                self.wfile.write(b'Content-Type: image/jpeg\r\n\r\n')
-                self.wfile.write(frame)
-                self.wfile.write(b'\r\n')
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                break
-
-    def log_message(self, *args):
-        pass
-
-
 @atexit.register
 def exit_func(*args):
     global arduino
@@ -170,6 +260,7 @@ def exit_func(*args):
             arduino.close()
         finally:
             arduino = None
+    streamer.stop()
 
 
 def main():
@@ -190,10 +281,7 @@ def main():
         return 1
 
     # Streaming server
-    server = ThreadingHTTPServer((STREAM_HOST, STREAM_PORT), StreamHandler)
-    stream_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    stream_thread.start()
-    print(f'[INFO] Streaming on http://{STREAM_HOST}:{STREAM_PORT}')
+    streamer.start()
 
     # Detector
     detector = TrafficLightDetector()
@@ -226,11 +314,23 @@ def main():
                 det_frame = cv2.resize(det_frame, TARGET_SIZE)
             fill_zones(det_frame)
 
-            # --- Детекция светофора ---
-            detections = detector.detect(det_frame)
+            # --- Детекция светофора в полосе 300-640 (как знак в task_2/StadionRunner.py) ---
+            h, w = det_frame.shape[:2]
+            y1 = min(DETECT_BAND_Y1, h)
+            y2 = min(DETECT_BAND_Y2, h)
+            band = det_frame[y1:y2, :]
+
+            detections = detector.detect(band)
+
+            # Корректируем координаты боксов обратно в полный кадр
+            for det in detections:
+                box = list(det['box'])  # convert tuple to list
+                box[1] += y1
+                det['box'] = box
+
             det_frame = detector.draw_detections(det_frame, detections)
 
-            # --- Треккинг центра bbox ---
+            # --- Треккинг центра bbox (как в task_2/StadionRunner.py) ---
             centers = []
             for det in detections:
                 box = det['box']
@@ -238,39 +338,23 @@ def main():
                 cy = box[1] + box[3] // 2
                 centers.append((cx, cy))
 
-            if centers:
-                if track_state['x'] is None:
-                    track_state['x'], track_state['y'] = centers[0]
-                    track_state['missed'] = 0
-                    track_state['confirmed'] = 1
-                    track_state['lost_printed'] = False
-                else:
-                    distances = [((cx - track_state['x'])**2 + (cy - track_state['y'])**2)**0.5 for cx, cy in centers]
-                    idx = int(np.argmin(distances))
-                    if distances[idx] <= TRACK_MAX_DIST:
-                        track_state['x'], track_state['y'] = centers[idx]
-                        track_state['missed'] = 0
-                        track_state['confirmed'] = min(track_state['confirmed'] + 1, TRACK_CONFIRM_FRAMES + 10)
-                    else:
-                        track_state['missed'] += 1
-            else:
-                track_state['missed'] += 1
+            update_tracker(centers, track_state)
 
             # Отрисовка трека на кадре для стрима
-            if track_state['confirmed'] >= TRACK_CONFIRM_FRAMES and track_state['x'] is not None:
+            if track_state['confirmed'] >= TRACK_CONFIRM and track_state['x'] is not None:
                 cv2.drawMarker(det_frame, (int(track_state['x']), int(track_state['y'])), (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
                 cv2.circle(det_frame, (int(track_state['x']), int(track_state['y'])), 6, (0, 0, 255), -1)
                 cv2.putText(det_frame, 'TRACKED', (int(track_state['x'])+10, int(track_state['y'])-10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-            # Проверка потери трека -> STOP
-            if track_state['missed'] > TRACK_MAX_MISSED and track_state['confirmed'] >= TRACK_CONFIRM_FRAMES and not track_state['lost_printed']:
+            # Проверка потери трека -> STOP (как в task_2/StadionRunner.py)
+            if track_state['missed'] > TRACK_MISS_MAX and track_state['confirmed'] >= TRACK_CONFIRM and not track_state['lost_printed']:
                 print('СТОП')
                 STATE = STOP
                 track_state['lost_printed'] = True
 
             # Сброс трека при длительной потере
-            if track_state['missed'] > TRACK_MAX_MISSED * 2:
+            if track_state['missed'] > TRACK_MISS_MAX * 2:
                 track_state.update(x=None, y=None, missed=0, confirmed=0, lost_printed=False)
 
             # --- Движение по разметке (нижняя часть кадра) ---
@@ -280,6 +364,8 @@ def main():
                 line_frame = cv2.resize(line_frame, SIZE)
                 gray = cv2.cvtColor(line_frame, cv2.COLOR_BGR2GRAY)
                 bin = cv2.inRange(gray, THRESHOLD, 255)
+                streamer.imshow('threshold', bin)
+                
 
                 wrapped = trans_perspective(bin, TRAP, RECT, SIZE)
                 left, right = find_lines(wrapped)
@@ -300,12 +386,11 @@ def main():
                 print(f'STATE: {STATE}')
                 PREV_STATE = STATE
 
-            # Стрим кадра с детекцией
-            ok, jpg = cv2.imencode('.jpg', det_frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-            if ok:
-                with jpeg_lock:
-                    global current_jpeg
-                    current_jpeg = jpg.tobytes()
+            # Стрим кадров в браузер
+            streamer.imshow('detection', det_frame)
+            streamer.imshow('original', frame)
+            if STATE != STOP:
+                streamer.imshow('line_detection', wrapped)
 
             end_time = time.time()
             fps = 1 / (end_time - start_time)
@@ -318,8 +403,7 @@ def main():
         if arduino is not None:
             arduino.close()
             arduino = None
-        server.shutdown()
-        server.server_close()
+        streamer.stop()
         cap.release()
     return 0
 

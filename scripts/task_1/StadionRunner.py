@@ -31,7 +31,7 @@ from road_utils import *
 
 
 CAR_SPEED = 1600  # скорость беспилотника
-THRESHOLD = 230  # порог бинаризации для поиска линий разметки
+THRESHOLD = 240  # порог бинаризации для поиска линий разметки
 CAMERA_ID = '/dev/video0'
 # ARDUINO_PORT = 'COM3'
 # ARDUINO_PORT = '/dev/ttyS0'
@@ -140,8 +140,9 @@ while True:
         orig_frame = frame.copy()
         frame = cv2.resize(frame, SIZE)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  # Переводим изображение в чёрно-белое с градациями серого
-        bin = cv2.inRange(gray, THRESHOLD, 255)  # Бинаризуем по порогу, должны остаться только белые линии разметки
-        # bin = binarize(frame, THRESHOLD)
+        # bin = cv2.inRange(gray, THRESHOLD, 255)  # Бинаризуем по порогу, должны остаться только белые линии разметки
+        bin = binarize(frame, THRESHOLD)
+
 
     
         wrapped = trans_perspective(bin, TRAP, RECT, SIZE)  # получаем область перед колёсами

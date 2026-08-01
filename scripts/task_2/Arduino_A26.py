@@ -46,7 +46,7 @@ class Arduino:
 
     # метод для отправки данных через UART
     def send_data(self, data: str):
-        print('Sent to Arduino:', data)
+        # print('Sent to Arduino:', data)
         data = '*' + data + '|'  # добавляем символ конца строки
         self.serial.write(data.encode(self.charset))
         self.serial.flush()

@@ -140,7 +140,7 @@ def main():
                         help='Video source (file, camera index, URL); default: video from this dir')
     args = parser.parse_args()
 
-    source = resolve_source(args.source)
+    source = ""
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
         print(f'[ERROR] Cannot open video source: {source}')

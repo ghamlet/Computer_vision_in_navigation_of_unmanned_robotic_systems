@@ -37,7 +37,7 @@ from road_utils import *
 
 
 CAR_SPEED = 1600  # скорость беспилотника
-THRESHOLD = 230  # порог бинаризации для поиска линий разметки
+THRESHOLD = 240  # порог бинаризации для поиска линий разметки
 CAMERA_ID = '/dev/video0'
 # ARDUINO_PORT = 'COM3'
 # ARDUINO_PORT = '/dev/ttyS0'
@@ -60,7 +60,7 @@ RED_RANGES = [               # диапазоны HSV для красного ц
 TRACK_DIST = 100     # макс. смещение центра между соседними кадрами, px
 TRACK_MISS_MAX = 5   # через сколько кадров без детекта трек сбрасывается
 TRACK_CONFIRM = 3    # сколько кадров подряд нужно для подтверждения
-TRACK_STATE = {'x': None, 'y': None, 'missed': 0, 'confirmed': 0}
+TRACK_STATE = {'x': None, 'y': None, 'missed': 0, 'confirmed': 0, 'lost_printed': False}
 
 # Команда «на взлёт» для квадрокоптера (скрипт-имитатор, слушает UDP)
 QUAD_HOST = '127.0.0.1'
@@ -89,13 +89,11 @@ def update_tracker(centroids):
     """Обновляет трек. Возвращает индекс выбранного треугольника или None."""
     if not centroids:
         TRACK_STATE['missed'] += 1
-        if TRACK_STATE['missed'] > TRACK_MISS_MAX:
-            TRACK_STATE.update(x=None, y=None, missed=0, confirmed=0)
         return None
 
     if TRACK_STATE['x'] is None:
         cx, cy = centroids[0]
-        TRACK_STATE.update(x=cx, y=cy, missed=0, confirmed=1)
+        TRACK_STATE.update(x=cx, y=cy, missed=0, confirmed=1, lost_printed=False)
         return 0
 
     distances = [dist_to_track(cx, cy) for cx, cy in centroids]
@@ -104,20 +102,27 @@ def update_tracker(centroids):
         # рядом с треком ничего нет — случайный объект, игнорируем
         TRACK_STATE['missed'] += 1
         if TRACK_STATE['missed'] > TRACK_MISS_MAX:
-            TRACK_STATE.update(x=None, y=None, missed=0, confirmed=0)
+            TRACK_STATE.update(x=None, y=None, missed=0, confirmed=0, lost_printed=False)
         return None
 
     cx, cy = centroids[idx]
-    TRACK_STATE.update(x=cx, y=cy, missed=0, confirmed=TRACK_STATE['confirmed'] + 1)
+    TRACK_STATE.update(x=cx, y=cy, missed=0, confirmed=min(TRACK_STATE['confirmed'] + 1, TRACK_CONFIRM + 10))
     return idx
 
 
-def find_triangular_red(frame):
-    """Ищет красные области в видимой полосе, возвращает треугольники
-    (массивы точек в координатах исходного кадра)."""
+def fill_zones(frame):
+    """Закрашивает зоны зеленым для стрима (как в combined_runner)."""
     h, w = frame.shape[:2]
-    y1 = min(TOP_FILL_H, h)
-    y2 = min(BOTTOM_FILL_Y, h)
+    cv2.rectangle(frame, (0, 0), (w, min(100, h)), (0, 255, 0), -1)
+    cv2.rectangle(frame, (0, min(640, h)), (w, h), (0, 255, 0), -1)
+    cv2.rectangle(frame, (0, 0), (min(870, w), h), (0, 255, 0), -1)
+
+
+def find_triangular_red(frame):
+    """Ищет красные треугольники в полосе кадра (как в оригинале task_2)."""
+    h, w = frame.shape[:2]
+    y1 = min(300, h)      # TOP_FILL_H оригинальный = 300
+    y2 = min(640, h)      # BOTTOM_FILL_Y = 640
     band = frame[y1:y2, :]
 
     hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
@@ -137,10 +142,13 @@ def find_triangular_red(frame):
             continue
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.05 * peri, True)
-        if len(approx) == 3:  # примерно треугольник
+        if len(approx) == 3:
             pts = approx.reshape(-1, 2).astype(np.int32)
             pts[:, 1] += y1  # возвращаем в координаты всего кадра
             found.append(pts)
+    
+    if found:
+        print(f'[DETECT] Found {len(found)} triangles in band {y1}-{y2}')
     return found
 
 
@@ -237,8 +245,11 @@ stream_thread = threading.Thread(target=server.serve_forever, daemon=True)
 stream_thread.start()
 print(f'[INFO] Streaming on http://{STREAM_HOST}:{STREAM_PORT}')
 
+
+
+
 # пропускаем часть кадров, для стабилизации настроек камеры
-for i in range(30):
+for i in range(50):
     ret, frame = cap.read()
 
 last_err = 0
@@ -252,21 +263,30 @@ while True:
         if not ret:
             break
 
-        # Детекция знака «новые территории» на полном кадре.
+        # Детекция знака «новые территории» на полном кадре (ОРИГИНАЛЬНЫЙ кадр без зелёных зон)
         triangles = find_triangular_red(frame) if STATE != STOP else []
         centroids = [triangle_center(pts) for pts in triangles]
         idx = update_tracker(centroids)
-        if idx is not None and TRACK_STATE['confirmed'] >= TRACK_CONFIRM:
-            print('на взлёт')
-            send_takeoff()
-            TRACK_STATE.update(x=None, y=None, missed=0, confirmed=0)
-            STATE = STOP
 
-        # Кадр для трансляции в браузер: полный кадр с отрисованной детекцией
+        # Кадр для трансляции в браузер: копия с зелеными зонами и отрисовкой
         stream_frame = frame.copy()
+        fill_zones(stream_frame)
         draw_signs(stream_frame, triangles)
-        if TRACK_STATE['x'] is not None:
+
+        # Отрисовка трека на кадре для стрима
+        if TRACK_STATE['confirmed'] >= TRACK_CONFIRM and TRACK_STATE['x'] is not None:
             draw_center(stream_frame, TRACK_STATE['x'], TRACK_STATE['y'])
+
+        # Проверка потери трека -> STOP
+        if TRACK_STATE['missed'] > TRACK_MISS_MAX and TRACK_STATE['confirmed'] >= TRACK_CONFIRM and not TRACK_STATE['lost_printed']:
+            print('СТОП')
+            STATE = STOP
+            TRACK_STATE['lost_printed'] = True
+
+        # Сброс трека при длительной потере
+        if TRACK_STATE['missed'] > TRACK_MISS_MAX * 2:
+            TRACK_STATE.update(x=None, y=None, missed=0, confirmed=0, lost_printed=False)
+
         if STATE == STOP:
             cv2.putText(stream_frame, 'НА ВЗЛЁТ', (30, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 4)
@@ -275,8 +295,8 @@ while True:
         orig_frame = frame.copy()
         frame = cv2.resize(frame, SIZE)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  # Переводим изображение в чёрно-белое с градациями серого
-        bin = cv2.inRange(gray, THRESHOLD, 255)  # Бинаризуем по порогу, должны остаться только белые линии разметки
-        # bin = binarize(frame, THRESHOLD)
+        # bin = cv2.inRange(gray, THRESHOLD, 255)  # Бинаризуем по порогу, должны остаться только белые линии разметки
+        bin = binarize(frame, THRESHOLD)
 
     
         wrapped = trans_perspective(bin, TRAP, RECT, SIZE)  # получаем область перед колёсами
@@ -290,7 +310,6 @@ while True:
         last_err = err
     
         angle = min(max(45, angle), 135)
-        print(angle)
     
     
        
