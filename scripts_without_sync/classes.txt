@@ -1,0 +1,10 @@
+pedestrian
+Sign: road works
+Sign: parking
+Sign: no entry
+Sign: pedestrian crossing
+Sign: movement prohibition
+Sign: artificial roughness
+Sign: give way
+Sign: stop
+traffic light

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+records/
+*.avi
+*.mp4
+*.tmfile
+*.tmfile.*
