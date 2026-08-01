@@ -1,5 +1,6 @@
 import json
 import struct
+import asyncio
 from dataclasses import dataclass, asdict
 from typing import List, Optional, Literal, Any
 from abc import ABC
@@ -115,6 +116,3 @@ async def recv_packet(reader: asyncio.StreamReader) -> BasePacket:
     length = struct.unpack(">I", length_bytes)[0]
     data = await reader.readexactly(length)
     return decode_packet(data)
-
-
-import asyncio
