@@ -1,68 +1,288 @@
 #!/usr/bin/env python3
-"""Детекция светофора и его состояния (working / notworking) через OpenCV DNN.
-
-Двухэтапная логика:
-  1. Сначала ищем светофор: объединяем ВСЕ детекции (working + notworking)
-     в одну общую рамку (union bbox) - это и есть "светофор".
-  2. Затем внутри рамки светофора детектим состояние (working / notworking):
-       - центр bbox каждого объекта должен лежать внутри bbox светофора;
-       - класс подтверждается только после НЕСКОЛЬКИХ кадров-детекций
-         (CONFIRM_FRAMES подряд).
-  Итоговый класс выводится в консоль и рисуется на кадре.
-
-Стриминг в браузер по MJPEG, ОДИН топик: http://<host>:<port>/stream
+"""
+Видеоанализ с двухэтапной детекцией светофора:
+1) yolopy (класс 9) находит светофор на всём кадре.
+2) YOLOv4-tiny (OpenCV DNN) определяет working/notworking только внутри bbox светофора.
+Стримит результат в браузер по MJPEG.
 """
 
-import argparse
 import os
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import cv2
 import numpy as np
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(SCRIPT_DIR, 'model')
-
-CFG = os.path.join(MODEL_DIR, 'yolov4-tiny-svetofor.cfg')
-WEIGHTS = os.path.join(MODEL_DIR, 'yolov4-tiny-svetofor_best_weights.weights')
-NAMES = os.path.join(MODEL_DIR, 'svetofor.names')
-
-INPUT_SIZE = 416
+try:
+    import yolopy
+    YOLOPY_AVAILABLE = True
+except ImportError:
+    YOLOPY_AVAILABLE = False
+    print("[WARNING] yolopy not available, running without model detection")
 
 # ========== КОНФИГУРАЦИЯ ==========
-SOURCE = 'auto'                 # путь к видео, индекс камеры или 'auto' (первое видео из ../records)
-CONF_THRESHOLD = 0.3            # порог уверенности для детекций
-NMS_THRESHOLD = 0.4             # порог NMS
-CONFIRM_FRAMES = 5              # сколько кадров-детекций нужно для подтверждения класса
-MAX_MISSED = 10                 # сколько кадров без детекций сбрасывают голосование
+SOURCE = 0  # веб-камера или путь к файлу
+
+# Зеленые зоны
+TOP_FILL_H = 100
+BOTTOM_FILL_Y = 640
+FILL_X = 870
+FILL_COLOR = (0, 255, 0)
+
+# Класс светофора в classes.txt (индекс 9)
+TRAFFIC_LIGHT_CLASS = 9
+
+# Размер кадра для обработки
+TARGET_SIZE = (1280, 960)
+
+# Параметры кропа вокруг bbox yolopy
+CROP_PADDING = 0.2         # 20% отступа с каждой стороны
+DNN_INPUT_SIZE = 416       # входной размер для DNN модели
+
+# HTTP streaming
 STREAM_HOST = '0.0.0.0'
 STREAM_PORT = 8089
-STREAM_TOPIC = '/stream'        # единственный топик для стриминга в браузер
 JPEG_QUALITY = 70
 
-COLORS = {
-    'working': (0, 255, 0),
-    'notworking': (0, 0, 255),
-}
-TRAFFIC_LIGHT_COLOR = (0, 255, 255)   # жёлтый - рамка светофора
-FONT = cv2.FONT_HERSHEY_SIMPLEX
+# Директории поиска моделей
+MODEL_DIR = Path("/home/arrma/Computer_vision_in_navigation_of_unmanned_robotic_systems/scripts/models")
+DNN_MODEL_DIR = Path(__file__).parent / "model"  # папка model рядом со скриптом
 
-# ========== HTTP-стриминг (один топик) ==========
 jpeg_lock = threading.Lock()
 current_jpeg = None
 
 
+def fill_zones(frame):
+    """Закрашивает зеленым: верх 100px, низ от 640px, лево до 870px"""
+    h, w = frame.shape[:2]
+    cv2.rectangle(frame, (0, 0), (w, min(TOP_FILL_H, h)), FILL_COLOR, -1)
+    cv2.rectangle(frame, (0, min(BOTTOM_FILL_Y, h)), (w, h), FILL_COLOR, -1)
+    cv2.rectangle(frame, (0, 0), (min(FILL_X, w), h), FILL_COLOR, -1)
+
+
+def find_file(name, search_dirs):
+    """Ищет файл по имени в списке директорий."""
+    for d in search_dirs:
+        p = Path(d) / name
+        if p.exists():
+            return p
+    return None
+
+
+# ======= Детектор yolopy (светофор, класс 9) =======
+class TrafficLightDetector:
+    def __init__(self, detect_class=TRAFFIC_LIGHT_CLASS):
+        self.detect_class = detect_class
+        self.model = None
+        self.class_names = []
+
+        if not YOLOPY_AVAILABLE:
+            print("[INFO] yolopy not available, detector disabled")
+            return
+
+        search_paths = [Path.cwd(), MODEL_DIR, Path('/home/avt_user/Base_Code'), Path('/home/avt_user/PROGRAMMS')]
+        classes_file = find_file('classes.txt', search_paths)
+        model_file = find_file('yolo_uint8.tmfile', search_paths)
+
+        if classes_file is None or model_file is None:
+            print("[WARNING] yolopy model files not found, detector disabled")
+            return
+
+        with open(classes_file) as f:
+            self.class_names = f.read().splitlines()
+
+        try:
+            self.model = yolopy.Model(
+                str(model_file),
+                use_uint8=True,
+                use_timvx=True,
+                cls_num=len(self.class_names)
+            )
+            self.model.set_anchors([18, 33, 33, 48, 25, 71, 58, 76, 40, 113, 87, 140])
+            print(f"[INFO] yolopy model loaded: {model_file}")
+        except Exception as e:
+            print(f"[ERROR] Failed to load yolopy model: {e}")
+            self.model = None
+
+    def detect(self, frame):
+        if self.model is None:
+            return []
+
+        try:
+            classes, scores, boxes = self.model.detect(frame)
+            results = []
+            for classid, score, box in zip(classes, scores, boxes):
+                if classid == self.detect_class and score > 0.3:
+                    results.append({
+                        'class': classid,
+                        'score': score,
+                        'box': box,   # [x, y, w, h]
+                        'label': self.class_names[classid] if classid < len(self.class_names) else f'class_{classid}'
+                    })
+            return results
+        except Exception as e:
+            print(f"[ERROR] yolopy detection failed: {e}")
+            return []
+
+    def draw_detections(self, frame, detections, color=(0, 255, 0)):
+        for det in detections:
+            box = det['box']
+            label = f"{det['label']} [{det['score']*100:.1f}%]"
+            cv2.rectangle(frame, (box[0], box[1]), (box[0]+box[2], box[1]+box[3]), color, 2)
+            cv2.putText(frame, label, (box[0], box[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        return frame
+
+
+# ======= Детектор YOLOv4-tiny (working / notworking) =======
+class DNNTrafficLightDetector:
+    def __init__(self, cfg_path=None, weights_path=None, names_path=None, input_size=DNN_INPUT_SIZE):
+        self.input_size = input_size
+        self.net = None
+        self.class_names = []
+        self.out_layers = None
+
+        search_dirs = [DNN_MODEL_DIR, Path.cwd(), MODEL_DIR]
+        cfg = cfg_path or find_file('yolov4-tiny-svetofor.cfg', search_dirs)
+        weights = weights_path or find_file('yolov4-tiny-svetofor_best_weights.weights', search_dirs)
+        names = names_path or find_file('svetofor.names', search_dirs)
+
+        missing = []
+        for name, path in [('cfg', cfg), ('weights', weights), ('names', names)]:
+            if not path or not Path(path).exists():
+                missing.append(name)
+        if missing:
+            print(f"[WARNING] YOLOv4-tiny DNN model files missing: {missing}. Detector disabled.")
+            return
+
+        with open(names) as f:
+            self.class_names = [line.strip() for line in f if line.strip()]
+
+        self.net = cv2.dnn.readNetFromDarknet(str(cfg), str(weights))
+        self.out_layers = self.net.getUnconnectedOutLayersNames()
+        print(f"[INFO] YOLOv4-tiny DNN model loaded: {weights}")
+
+    def detect_on_crop(self, crop, conf_threshold=0.25, nms_threshold=0.4):
+        """Запускает детекцию на кропе, возвращает список детекций в координатах кропа (после ресайза)."""
+        if self.net is None:
+            return []
+
+        # Ресайз кропа до input_size
+        resized = cv2.resize(crop, (self.input_size, self.input_size))
+        blob = cv2.dnn.blobFromImage(resized, 1/255.0, (self.input_size, self.input_size),
+                                     swapRB=True, crop=False)
+        self.net.setInput(blob)
+        outs = self.net.forward(self.out_layers)
+
+        boxes_list, confidences, class_ids = [], [], []
+        # Размеры после ресайза – всегда input_size x input_size
+        h_resized, w_resized = self.input_size, self.input_size
+        for out in outs:
+            for detection in out:
+                scores = detection[5:]
+                class_id = int(np.argmax(scores))
+                confidence = float(scores[class_id])
+                if confidence < conf_threshold:
+                    continue
+                # Координаты в масштабе resized
+                cx, cy, bw, bh = detection[:4] * np.array([w_resized, h_resized, w_resized, h_resized])
+                boxes_list.append([
+                    int(cx - bw/2),
+                    int(cy - bh/2),
+                    int(bw),
+                    int(bh)
+                ])
+                confidences.append(confidence)
+                class_ids.append(class_id)
+
+        results = []
+        if boxes_list:
+            indices = cv2.dnn.NMSBoxes(boxes_list, confidences, conf_threshold, nms_threshold)
+            indices = np.array(indices).flatten() if len(indices) else []
+            for i in indices:
+                label = self.class_names[class_ids[i]]
+                results.append({
+                    'class': label,
+                    'score': confidences[i],
+                    'box': boxes_list[i],   # x, y, w, h в масштабе resized
+                    'label': f"{label} {confidences[i]*100:.0f}%"
+                })
+        return results
+
+    def draw_detections(self, frame, detections):
+        colors = {'working': (0, 255, 0), 'notworking': (0, 0, 255)}
+        for det in detections:
+            box = det['box']
+            color = colors.get(det['class'], (255, 255, 255))
+            cv2.rectangle(frame, (box[0], box[1]), (box[0]+box[2], box[1]+box[3]), color, 2)
+            cv2.putText(frame, det['label'], (box[0], box[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        return frame
+
+
+# ======= Вспомогательная функция: обработка региона светофора =======
+def process_traffic_light_region(frame, bbox, dnn_detector):
+    """
+    Вырезает область вокруг bbox, прогоняет через DNN и возвращает детекции
+    в координатах исходного кадра.
+    bbox: [x, y, w, h]
+    """
+    x, y, w, h = bbox
+    pad_w = int(w * CROP_PADDING)
+    pad_h = int(h * CROP_PADDING)
+
+    # Границы кропа с учётом padding, не выходя за пределы кадра
+    x1 = max(0, x - pad_w)
+    y1 = max(0, y - pad_h)
+    x2 = min(frame.shape[1], x + w + pad_w)
+    y2 = min(frame.shape[0], y + h + pad_h)
+
+    if x2 <= x1 or y2 <= y1:
+        return []
+
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return []
+
+    # Детекция на кропе
+    detections_resized = dnn_detector.detect_on_crop(crop)  # box в масштабе input_size
+
+    # Масштабируем координаты обратно на исходный кроп, затем добавляем смещение
+    crop_w = x2 - x1
+    crop_h = y2 - y1
+    scale_x = crop_w / dnn_detector.input_size
+    scale_y = crop_h / dnn_detector.input_size
+
+    global_detections = []
+    for det in detections_resized:
+        bx, by, bw, bh = det['box']
+        # В координатах кропа
+        bx_crop = int(bx * scale_x)
+        by_crop = int(by * scale_y)
+        bw_crop = int(bw * scale_x)
+        bh_crop = int(bh * scale_y)
+        # В координатах полного кадра
+        gx = x1 + bx_crop
+        gy = y1 + by_crop
+        global_detections.append({
+            'class': det['class'],
+            'score': det['score'],
+            'box': [gx, gy, bw_crop, bh_crop],
+            'label': det['label']
+        })
+    return global_detections
+
+
+# ======= HTTP стриминг =======
 class StreamHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path != STREAM_TOPIC:
-            self.send_response(404)
-            self.end_headers()
+        if self.path != '/':
+            self.send_error(404)
             return
         self.send_response(200)
         self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
-        self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
         while True:
             with jpeg_lock:
@@ -81,193 +301,77 @@ class StreamHandler(BaseHTTPRequestHandler):
         pass
 
 
-# ========== Детектор светофора (OpenCV DNN) ==========
-class SvetoforDetector:
-    def __init__(self, conf_threshold=CONF_THRESHOLD, nms_threshold=NMS_THRESHOLD):
-        self.conf_threshold = conf_threshold
-        self.nms_threshold = nms_threshold
-        if not os.path.exists(CFG) or not os.path.exists(WEIGHTS):
-            print(f'[ERROR] Model files not found in {MODEL_DIR}')
-            sys.exit(1)
-        with open(NAMES) as f:
-            self.class_names = f.read().splitlines()
-        self.net = cv2.dnn.readNetFromDarknet(CFG, WEIGHTS)
-        self.out_layers = self.net.getUnconnectedOutLayersNames()
-        print(f'[INFO] Model loaded, classes={self.class_names}')
-
-    def detect(self, frame):
-        """Возвращает список детекций состояния: {class, score, box, label}."""
-        h, w = frame.shape[:2]
-        blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (INPUT_SIZE, INPUT_SIZE),
-                                     swapRB=True, crop=False)
-        self.net.setInput(blob)
-        outs = self.net.forward(self.out_layers)
-
-        boxes, confidences, class_ids = [], [], []
-        for out in outs:
-            for detection in out:
-                scores = detection[5:]
-                class_id = int(np.argmax(scores))
-                confidence = float(scores[class_id])
-                if confidence < self.conf_threshold:
-                    continue
-                cx, cy, bw, bh = detection[:4] * np.array([w, h, w, h])
-                boxes.append([int(cx - bw / 2), int(cy - bh / 2), int(bw), int(bh)])
-                confidences.append(confidence)
-                class_ids.append(class_id)
-
-        results = []
-        if boxes:
-            indices = cv2.dnn.NMSBoxes(boxes, confidences, self.conf_threshold, self.nms_threshold)
-            indices = np.array(indices).flatten() if len(indices) else []
-            for i in indices:
-                results.append({
-                    'class': self.class_names[class_ids[i]],
-                    'score': confidences[i],
-                    'box': boxes[i],
-                    'label': f"{self.class_names[class_ids[i]]} {confidences[i] * 100:.0f}%",
-                })
-        return results
-
-
-# ========== Вспомогательные функции ==========
-def union_box(boxes):
-    """Общая рамка (union bbox) всех детекций = найденный светофор."""
-    xs = [b[0] for b in boxes]
-    ys = [b[1] for b in boxes]
-    x2 = [b[0] + b[2] for b in boxes]
-    y2 = [b[1] + b[3] for b in boxes]
-    return [min(xs), min(ys), max(x2) - min(xs), max(y2) - min(ys)]
-
-
-def center_inside(box, region):
-    """Проверка, что центр bbox находится внутри рамки светофора."""
-    cx = box[0] + box[2] / 2
-    cy = box[1] + box[3] / 2
-    x, y, w, h = region
-    return x <= cx <= x + w and y <= cy <= y + h
-
-
-def resolve_source(source):
-    if source != 'auto':
-        return source
-    records = os.path.abspath(os.path.join(SCRIPT_DIR, '..', '..', 'records'))
-    videos = sorted(f for f in os.listdir(records)
-                    if f.lower().endswith(('.avi', '.mp4', '.mov', '.mkv'))) if os.path.isdir(records) else []
-    if not videos:
-        print(f'[ERROR] No videos in {records}, pass --source explicitly')
-        sys.exit(1)
-    return os.path.join(records, videos[0])
-
-
 def main():
-    parser = argparse.ArgumentParser(description='Traffic light + state detection with MJPEG stream')
-    parser.add_argument('--source', '-s', default=SOURCE, help='Video source (file, camera index, auto)')
-    parser.add_argument('--conf', type=float, default=CONF_THRESHOLD, help='Confidence threshold')
-    parser.add_argument('--nms', type=float, default=NMS_THRESHOLD, help='NMS threshold')
-    parser.add_argument('--confirm', type=int, default=CONFIRM_FRAMES,
-                        help='Frames needed to confirm final class')
-    parser.add_argument('--port', type=int, default=STREAM_PORT, help='HTTP stream port')
-    args = parser.parse_args()
-
-    detector = SvetoforDetector(args.conf, args.nms)
-
-    source = "/dev/video0"
-    cap = cv2.VideoCapture(source)
+    cap = cv2.VideoCapture(SOURCE)
     if not cap.isOpened():
-        print(f'[ERROR] Cannot open video source: {source}')
+        print(f'[ERROR] Cannot open video source: {SOURCE}')
         return 1
-    print(f'[INFO] Source: {source}')
 
-    server = ThreadingHTTPServer((STREAM_HOST, args.port), StreamHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f'[INFO] Stream topic: http://{STREAM_HOST}:{args.port}{STREAM_TOPIC}')
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f'[INFO] Source: {SOURCE}')
+    print(f'[INFO] Resolution: {width}x{height}')
+    print(f'[INFO] Green zones: top {TOP_FILL_H}px, bottom from {BOTTOM_FILL_Y}px, left {FILL_X}px')
+    print(f'[INFO] Stream: http://{STREAM_HOST}:{STREAM_PORT}/')
+    print(f'[INFO] Pipeline: yolopy -> traffic light bbox -> DNN (working/notworking) inside bbox')
 
-    # --- состояние голосования ---
-    vote = {
-        'class': None,        # текущий кандидат
-        'frames': 0,          # сколько кадров подряд его видим
-        'missed': 0,          # сколько кадров без детекций
-        'final': None,        # подтверждённый класс
-        'printed': None,
-    }
+    # Инициализация детекторов
+    yolopy_detector = TrafficLightDetector()
+    dnn_detector = DNNTrafficLightDetector()
 
-    def confirm_vote(detections):
-        """Голосование: подтверждаем класс после CONFIRM_FRAMES кадров подряд."""
-        if detections:
-            # кандидат - класс с максимальной уверенностью в кадре
-            best = max(detections, key=lambda d: d['score'])
-            if best['class'] == vote['class']:
-                vote['frames'] += 1
-            else:
-                vote['class'] = best['class']
-                vote['frames'] = 1
-            vote['missed'] = 0
-        else:
-            vote['missed'] += 1
-            if vote['missed'] > MAX_MISSED:
-                vote['class'] = None
-                vote['frames'] = 0
-            if vote['missed'] > MAX_MISSED * 2:
-                vote['final'] = None
+    server = ThreadingHTTPServer((STREAM_HOST, STREAM_PORT), StreamHandler)
+    stream_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    stream_thread.start()
+    print("[INFO] Streaming server started")
 
-        if vote['class'] is not None and vote['frames'] >= args.confirm:
-            if vote['final'] != vote['class']:
-                vote['final'] = vote['class']
-                print(f'[RESULT] Светофор: {vote["final"]}')
-
-    global current_jpeg
     try:
+        frame_count = 0
         while True:
             ret, frame = cap.read()
             if not ret:
-                if isinstance(source, str) and source.lower().endswith(('.avi', '.mp4', '.mov', '.mkv')):
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # зацикливаем видео
-                    vote.update({'class': None, 'frames': 0, 'missed': 0, 'final': None})
+                if isinstance(SOURCE, str) and SOURCE.lower().endswith(('.avi', '.mp4', '.mov', '.mkv')):
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
                 break
 
-            # 1) детектируем состояние (working/notworking)
-            detections = detector.detect(frame)
+            frame_count += 1
+            if TARGET_SIZE:
+                frame = cv2.resize(frame, TARGET_SIZE)
 
-            # 2) если нашли хоть что-то - это светофор (union bbox)
-            if detections:
-                tl_box = union_box([d['box'] for d in detections])
-                # 3) оставляем только объекты, чей центр внутри рамки светофора
-                inside = [d for d in detections if center_inside(d['box'], tl_box)]
+            fill_zones(frame)
+
+            # --- Этап 1: поиск светофора yolopy ---
+            tl_detections = yolopy_detector.detect(frame)
+            # Рисуем bbox светофоров (зелёные)
+            yolopy_detector.draw_detections(frame, tl_detections, color=(255, 255, 0))
+
+            # --- Этап 2: для каждого светофора определяем working/notworking ---
+            if tl_detections:
+                print(f"\n--- Frame {frame_count} ---")
+                for idx, tl in enumerate(tl_detections):
+                    bbox = tl['box']
+                    print(f"Светофор #{idx+1}: bbox={bbox}, score={tl['score']:.2f}")
+                    # Запускаем DNN на кропе
+                    status_dets = process_traffic_light_region(frame, bbox, dnn_detector)
+                    if status_dets:
+                        for det in status_dets:
+                            print(f"  -> Статус: {det['class']} ({det['score']*100:.0f}%)")
+                    else:
+                        print("  -> Статус не определён")
+                    # Рисуем результаты DNN (красные/зелёные боксы)
+                    dnn_detector.draw_detections(frame, status_dets)
             else:
-                tl_box = None
-                inside = []
+                print(f"Frame {frame_count}: светофор не найден")
 
-            # 4) голосование для подтверждения класса (наличие нескольких детекций)
-            confirm_vote(inside)
-
-            # --- отрисовка ---
-            if tl_box is not None:
-                x, y, w, h = tl_box
-                cv2.rectangle(frame, (x, y), (x + w, y + h), TRAFFIC_LIGHT_COLOR, 2)
-                cv2.putText(frame, 'svetofor', (x, y - 10), FONT, 0.6, TRAFFIC_LIGHT_COLOR, 2)
-            for det in inside:
-                box = det['box']
-                color = COLORS.get(det['class'], (255, 255, 255))
-                cv2.rectangle(frame, (box[0], box[1]), (box[0] + box[2], box[1] + box[3]), color, 2)
-                cv2.putText(frame, det['label'], (box[0], box[1] - 10), FONT, 0.5, color, 2)
-                cx, cy = box[0] + box[2] // 2, box[1] + box[3] // 2
-                cv2.drawMarker(frame, (cx, cy), (255, 255, 255), cv2.MARKER_CROSS, 12, 1)
-
-            # итоговый класс
-            if vote['final']:
-                text = f'CLASS: {vote["final"]}'
-                color = COLORS.get(vote['final'], (255, 255, 255))
-                cv2.putText(frame, text, (30, 50), FONT, 1.0, color, 3)
-
+            # Отправка в стрим
             ok, jpg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
             if ok:
                 with jpeg_lock:
+                    global current_jpeg
                     current_jpeg = jpg.tobytes()
 
     except KeyboardInterrupt:
-        print('\n[INFO] Stopping...')
+        print("\n[INFO] Stopping...")
     finally:
         cap.release()
         server.shutdown()
