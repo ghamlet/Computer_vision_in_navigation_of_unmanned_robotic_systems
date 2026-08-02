@@ -80,7 +80,7 @@ class TrafficLightDetector:
             return
 
         classes_file = find_model_file('classes.txt')
-        model_file = find_model_file('yolo_uint8.tmfile')
+        model_file = "home/avt_user/PROGRAMMS/task_5/cvt_yolov4-tiny-original.tmfile"
 
         if classes_file is None or model_file is None:
             print("[WARNING] Model files not found, detector disabled")
