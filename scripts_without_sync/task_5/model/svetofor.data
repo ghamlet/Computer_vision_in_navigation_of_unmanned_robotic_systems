@@ -1,0 +1,5 @@
+classes = 2
+train = /content/darknet/data/svetofor_train.txt
+valid = /content/darknet/data/svetofor_valid.txt
+names = /content/darknet/data/svetofor.names
+backup = /content/drive/MyDrive/Colab_demo/backup
